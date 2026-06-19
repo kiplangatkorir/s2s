@@ -8,6 +8,36 @@ export type Message = {
   text: string;
 };
 
+// Resample float32 audio from one rate to another (simple linear interpolation)
+function resampleFloat32(
+  buffer: Float32Array,
+  fromRate: number,
+  toRate: number
+): Float32Array {
+  if (fromRate === toRate) return buffer;
+  const ratio = fromRate / toRate;
+  const newLength = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i++) {
+    const srcIndex = i * ratio;
+    const srcFloor = Math.floor(srcIndex);
+    const srcCeil = Math.min(srcFloor + 1, buffer.length - 1);
+    const frac = srcIndex - srcFloor;
+    result[i] = buffer[srcFloor] * (1 - frac) + buffer[srcCeil] * frac;
+  }
+  return result;
+}
+
+// Convert Float32 [-1, 1] to Int16 PCM bytes
+function float32ToInt16Bytes(float32: Float32Array): ArrayBuffer {
+  const int16 = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return int16.buffer;
+}
+
 export function useAudioSocket(url: string) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isRecording, setIsRecording] = useState(false);
@@ -17,9 +47,13 @@ export function useAudioSocket(url: string) {
   const [streamingText, setStreamingText] = useState("");
 
   const wsRef = useRef<WebSocket | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const scriptNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const pcmBufferRef = useRef<Float32Array[]>([]);
 
+  const audioPlaybackContextRef = useRef<AudioContext | null>(null);
   const audioQueueRef = useRef<Float32Array[]>([]);
   const isPlayingRef = useRef(false);
   const nextStartTimeRef = useRef(0);
@@ -30,18 +64,21 @@ export function useAudioSocket(url: string) {
     audioQueueRef.current = [];
     nextStartTimeRef.current = 0;
     isPlayingRef.current = false;
-    if (audioContextRef.current && audioContextRef.current.state !== "closed") {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
+    if (
+      audioPlaybackContextRef.current &&
+      audioPlaybackContextRef.current.state !== "closed"
+    ) {
+      audioPlaybackContextRef.current.close();
+      audioPlaybackContextRef.current = null;
     }
     setIsSpeaking(false);
   }, []);
 
   const processAudioQueue = useCallback(() => {
     if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
-    if (!audioContextRef.current) return;
+    if (!audioPlaybackContextRef.current) return;
 
-    const ctx = audioContextRef.current;
+    const ctx = audioPlaybackContextRef.current;
     isPlayingRef.current = true;
     setIsSpeaking(true);
 
@@ -70,14 +107,14 @@ export function useAudioSocket(url: string) {
   const playAudioChunk = useCallback(
     async (blob: Blob) => {
       if (
-        !audioContextRef.current ||
-        audioContextRef.current.state === "closed"
+        !audioPlaybackContextRef.current ||
+        audioPlaybackContextRef.current.state === "closed"
       ) {
-        audioContextRef.current = new (window.AudioContext ||
+        audioPlaybackContextRef.current = new (window.AudioContext ||
           (window as any).webkitAudioContext)();
       }
-      if (audioContextRef.current.state === "suspended") {
-        audioContextRef.current.resume();
+      if (audioPlaybackContextRef.current.state === "suspended") {
+        audioPlaybackContextRef.current.resume();
       }
 
       try {
@@ -131,7 +168,8 @@ export function useAudioSocket(url: string) {
               setStreamingText("");
             } else if (data.type === "text_delta") {
               streamingTextRef.current += data.text;
-              if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+              if (animFrameRef.current)
+                cancelAnimationFrame(animFrameRef.current);
               animFrameRef.current = requestAnimationFrame(() => {
                 setStreamingText(streamingTextRef.current);
               });
@@ -174,27 +212,57 @@ export function useAudioSocket(url: string) {
   }, [url, playAudioChunk]);
 
   const startRecording = useCallback(async () => {
-    // Barge-in: stop any current playback
     stopPlayback();
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: "audio/webm",
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
       });
-      mediaRecorderRef.current = mediaRecorder;
+      micStreamRef.current = stream;
 
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(e.data);
+      // Create an AudioContext to capture raw PCM from the mic
+      const audioCtx = new AudioContext();
+      audioContextRef.current = audioCtx;
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      sourceNodeRef.current = source;
+
+      // ScriptProcessorNode captures raw PCM frames
+      const bufferSize = 4096;
+      const scriptNode = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+      scriptNodeRef.current = scriptNode;
+
+      const nativeSampleRate = audioCtx.sampleRate; // usually 44100 or 48000
+      const TARGET_RATE = 16000;
+
+      scriptNode.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        // Copy the data (Float32Array is reused by the browser)
+        const copy = new Float32Array(inputData);
+        pcmBufferRef.current.push(copy);
+
+        // Send PCM chunk immediately for low-latency streaming
+        // Resample to 16kHz and convert to int16
+        const resampled = resampleFloat32(copy, nativeSampleRate, TARGET_RATE);
+        const pcmBytes = float32ToInt16Bytes(resampled);
+
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(pcmBytes);
         }
       };
 
+      source.connect(scriptNode);
+      scriptNode.connect(audioCtx.destination);
+
+      // Clear playback state
       audioQueueRef.current = [];
       nextStartTimeRef.current = 0;
       isPlayingRef.current = false;
 
-      mediaRecorder.start(250);
       setIsRecording(true);
     } catch (err) {
       console.error("Error accessing microphone:", err);
@@ -202,14 +270,32 @@ export function useAudioSocket(url: string) {
   }, [stopPlayback]);
 
   const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      mediaRecorderRef.current.stream.getTracks().forEach((t) => t.stop());
-      setIsRecording(false);
+    if (!isRecording) return;
 
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: "end_turn" }));
-      }
+    // Disconnect the audio graph
+    if (scriptNodeRef.current) {
+      scriptNodeRef.current.disconnect();
+      scriptNodeRef.current = null;
+    }
+    if (sourceNodeRef.current) {
+      sourceNodeRef.current.disconnect();
+      sourceNodeRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+
+    pcmBufferRef.current = [];
+    setIsRecording(false);
+
+    // Tell backend the turn is over
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "end_turn" }));
     }
   }, [isRecording]);
 
