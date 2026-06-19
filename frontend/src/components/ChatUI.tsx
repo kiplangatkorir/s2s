@@ -5,8 +5,8 @@ import { useAudioSocket } from "@/lib/useAudioSocket";
 
 export default function ChatUI() {
   const { messages, isRecording, isConnected, toggleRecording } = useAudioSocket(
-    // You can point this to the backend URL, hardcoded local for testing
-    "ws://localhost:8000/ws"
+    // You can point this to the backend URL via env var for Vercel
+    process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/ws"
   );
 
   return (
