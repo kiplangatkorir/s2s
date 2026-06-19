@@ -109,7 +109,7 @@ class S2SPipeline:
         self,
         audio_bytes: bytes,
         language: str | None = None,
-    ) -> AsyncGenerator[bytes, None]:
+    ) -> AsyncGenerator[bytes | dict, None]:
         """
         Full S2S turn:
           1. ASR   — stream partial transcripts while audio arrives
@@ -137,12 +137,18 @@ class S2SPipeline:
             logger.info(f"[{self.session_id}] Transcript: '{transcript}'")
             self.session.add_user_turn(transcript)
 
+            yield {
+                "type": "transcript",
+                "text": transcript,
+                "role": "user"
+            }
+
             # ── Stages 2+3: LLM → TTS (concurrent) ─
-            async for audio_chunk in self._run_llm_tts(transcript, lang, tracker):
+            async for chunk in self._run_llm_tts(transcript, lang, tracker):
                 if self.barge_in.triggered:
                     logger.info(f"[{self.session_id}] Barge-in detected, stopping audio.")
                     break
-                yield audio_chunk
+                yield chunk
 
         except asyncio.CancelledError:
             logger.info(f"[{self.session_id}] Pipeline cancelled.")
@@ -191,7 +197,7 @@ class S2SPipeline:
         transcript: str,
         language: str,
         tracker: LatencyTracker,
-    ) -> AsyncGenerator[bytes, None]:
+    ) -> AsyncGenerator[bytes | dict, None]:
         """
         Streams tokens from DeepSeek V4 and pipes phrase-boundary chunks
         to Sauti TTS concurrently. TTS synthesis starts before LLM finishes.
@@ -247,6 +253,12 @@ class S2SPipeline:
         full_response = splitter.full_text()
         self.session.add_assistant_turn(full_response)
         self.context.add_assistant_message(full_response)
+
+        yield {
+            "type": "llm_response",
+            "text": full_response,
+            "role": "assistant"
+        }
 
     async def _stream_llm_to_queue(
         self,

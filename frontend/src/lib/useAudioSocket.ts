@@ -9,38 +9,7 @@ export type Message = {
 };
 
 export function useAudioSocket(url: string) {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: "1",
-      role: "user",
-      text: "habari yako rafiki",
-    },
-    {
-      id: "2",
-      role: "assistant",
-      text: "Sijambo, rafiki. Asante kwa kuuliza. Na wewe hujambo?",
-    },
-    {
-      id: "3",
-      role: "user",
-      text: "nataka kuuliza swali kuhusu nchi ya kenya",
-    },
-    {
-      id: "4",
-      role: "assistant",
-      text: "Karibu sana. Ninaweza kukusaidia kuhusu nchi ya Kenya. Tafadhali uliza swali lako.",
-    },
-    {
-      id: "5",
-      role: "user",
-      text: "kenya inapatikana wapi",
-    },
-    {
-      id: "6",
-      role: "assistant",
-      text: "Kenya iko katika Afrika Mashariki. Inapakana na Tanzania upande wa Kusini, Uganda upande wa Magharibi, Ethiopia upande wa Kaskazini, Somalia upande wa Mashariki, na Bahari ya Hindi upande wa Kusini-Mashariki.",
-    },
-  ]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
 
@@ -136,6 +105,12 @@ export function useAudioSocket(url: string) {
               console.log("Turn completed");
             } else if (data.type === "error") {
               console.error("Error from backend:", data.detail);
+            } else if (data.type === "transcript" || data.type === "llm_response") {
+              setMessages(prev => [...prev, {
+                id: Date.now().toString(),
+                role: data.role,
+                text: data.text
+              }]);
             }
           } catch (e) {
             console.warn("Could not parse JSON:", event.data);

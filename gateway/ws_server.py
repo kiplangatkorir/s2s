@@ -68,8 +68,11 @@ def create_app(
                     audio_buffer.clear()
 
                     try:
-                        async for audio_chunk in pipeline.run(audio_bytes):
-                            await websocket.send_bytes(audio_chunk)
+                        async for chunk in pipeline.run(audio_bytes):
+                            if isinstance(chunk, dict):
+                                await websocket.send_json(chunk)
+                            else:
+                                await websocket.send_bytes(chunk)
                     except Exception as exc:
                         await websocket.send_json({"type": "error", "detail": str(exc)})
                         continue
