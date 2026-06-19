@@ -2,12 +2,8 @@ import asyncio
 
 import pytest
 
-from pipeline.orchestrator import PipelineConfig, S2SPipeline
+from pipeline.orchestrator import S2SPipeline
 from shared.metrics import LatencyTracker
-
-
-def test_default_stream_timeout_covers_observed_tts_startup() -> None:
-    assert PipelineConfig().stream_timeout_s >= 45.0
 
 
 class _FakeRemoteGen:

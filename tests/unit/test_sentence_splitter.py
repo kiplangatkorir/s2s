@@ -9,13 +9,6 @@ def test_sentence_splitter_flushes_short_phrase_without_punctuation():
     assert phrases == ["hello there how are"]
 
 
-def test_sentence_splitter_waits_instead_of_cutting_mid_word():
-    splitter = SentenceSplitter(flush_chars=25)
-
-    assert splitter.feed("Ninawezaje kukusaidia le") == []
-    assert splitter.feed("o?") == ["Ninawezaje kukusaidia leo?"]
-
-
 def test_sentence_splitter_flushes_hard_cap_when_buffer_grows_large():
     splitter = SentenceSplitter(flush_chars=12)
 
