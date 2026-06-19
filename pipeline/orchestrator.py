@@ -116,8 +116,7 @@ class S2SPipeline:
           2. LLM   — stream tokens from DeepSeek V4 as transcript finalises
           3. TTS   — stream audio chunks as LLM phrases complete
 
-        Yields raw PCM playback bytes from TTS. VoxCPM2 currently emits
-        48 kHz mono int16 PCM unless output_format is changed.
+        Yields raw PCM playback bytes from TTS and text_delta dicts.
         Call barge_in.trigger() from your VAD handler to cancel mid-turn.
         """
         lang = language or self.config.language
@@ -147,6 +146,49 @@ class S2SPipeline:
             async for chunk in self._run_llm_tts(transcript, lang, tracker):
                 if self.barge_in.triggered:
                     logger.info(f"[{self.session_id}] Barge-in detected, stopping audio.")
+                    break
+                yield chunk
+
+        except asyncio.CancelledError:
+            logger.info(f"[{self.session_id}] Pipeline cancelled.")
+        except Exception as e:
+            logger.error(f"[{self.session_id}] Pipeline error: {e}", exc_info=True)
+            raise
+        finally:
+            tracker.mark("pipeline_end")
+            tracker.log_summary()
+
+    async def run_text(
+        self,
+        text: str,
+        language: str | None = None,
+    ) -> AsyncGenerator[bytes | dict, None]:
+        """
+        Text-only turn (skips ASR). Accepts a plain text string from the
+        client and runs LLM → TTS directly.
+        """
+        lang = language or self.config.language
+        tracker = LatencyTracker(session_id=self.session_id)
+        self.barge_in.reset()
+
+        tracker.mark("pipeline_start")
+
+        try:
+            transcript = text.strip()
+            if not transcript:
+                return
+
+            logger.info(f"[{self.session_id}] Text input: '{transcript}'")
+            self.session.add_user_turn(transcript)
+
+            yield {
+                "type": "transcript",
+                "text": transcript,
+                "role": "user"
+            }
+
+            async for chunk in self._run_llm_tts(transcript, lang, tracker):
+                if self.barge_in.triggered:
                     break
                 yield chunk
 
@@ -202,8 +244,11 @@ class S2SPipeline:
         Streams tokens from DeepSeek V4 and pipes phrase-boundary chunks
         to Sauti TTS concurrently. TTS synthesis starts before LLM finishes.
 
+        Yields both text_delta dicts (for streaming text on the client)
+        and raw audio bytes from TTS, interleaved via a shared output queue.
+
         Architecture:
-            LLM token stream
+            LLM token stream → text_delta yielded immediately
                 └─► SentenceSplitter
                         └─► phrase queue
                                 └─► TTS synthesis tasks (concurrent)
@@ -211,34 +256,49 @@ class S2SPipeline:
         """
         splitter = SentenceSplitter(flush_chars=self.config.tts_chunk_size)
         phrase_queue: asyncio.Queue[str | None] = asyncio.Queue()
-        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        output_queue: asyncio.Queue[bytes | dict | None] = asyncio.Queue()
         error_queue: asyncio.Queue[Exception] = asyncio.Queue()
 
-        # Task A: Stream LLM tokens → split into phrases → phrase_queue
+        # Task A: Stream LLM tokens → text deltas + phrases
         llm_task = asyncio.create_task(
-            self._stream_llm_to_queue(transcript, splitter, phrase_queue, error_queue, tracker)
+            self._stream_llm_to_output(
+                transcript, splitter, phrase_queue, output_queue, error_queue, tracker
+            )
         )
 
-        # Task B: Consume phrases → TTS → audio_queue
+        # Task B: Consume phrases → TTS → audio into output_queue
         tts_task = asyncio.create_task(
-            self._stream_tts_from_queue(phrase_queue, audio_queue, error_queue, language, tracker)
+            self._stream_tts_to_output(
+                phrase_queue, output_queue, error_queue, language, tracker
+            )
         )
 
-        # Yield audio chunks as they arrive
+        # Drain output_queue — yields text deltas and audio interleaved
+        sentinels_seen = 0
         stream_error: Exception | None = None
         try:
-            while True:
-                audio_chunk = await asyncio.wait_for(
-                    audio_queue.get(),
-                    timeout=self.config.stream_timeout_s,
-                )
-                if audio_chunk is None:
+            while sentinels_seen < 2:
+                try:
+                    item = await asyncio.wait_for(
+                        output_queue.get(),
+                        timeout=self.config.stream_timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    stream_error = TimeoutError(
+                        f"[{self.session_id}] Output stream timed out."
+                    )
+                    logger.warning(str(stream_error))
                     break
-                yield audio_chunk
 
-        except asyncio.TimeoutError:
-            stream_error = TimeoutError(f"[{self.session_id}] TTS stream timed out.")
-            logger.warning(str(stream_error))
+                if item is None:
+                    sentinels_seen += 1
+                    continue
+
+                if self.barge_in.triggered:
+                    break
+
+                yield item
+
         finally:
             llm_task.cancel()
             tts_task.cancel()
@@ -260,15 +320,20 @@ class S2SPipeline:
             "role": "assistant"
         }
 
-    async def _stream_llm_to_queue(
+    async def _stream_llm_to_output(
         self,
         transcript: str,
         splitter: SentenceSplitter,
         phrase_queue: asyncio.Queue,
+        output_queue: asyncio.Queue,
         error_queue: asyncio.Queue,
         tracker: LatencyTracker,
     ) -> None:
-        """Streams DeepSeek V4 tokens and pushes complete phrases to queue."""
+        """
+        Streams DeepSeek V4 tokens. Each token is pushed to output_queue as a
+        text_delta dict immediately AND fed to the SentenceSplitter for phrase
+        extraction into phrase_queue.
+        """
         import httpx
 
         messages = self.context.build_messages(user_message=transcript)
@@ -313,6 +378,12 @@ class S2SPipeline:
                             tracker.mark("llm_first_token")
                             first_token = False
 
+                        # Stream text delta to client immediately
+                        await output_queue.put({
+                            "type": "text_delta",
+                            "text": delta,
+                        })
+
                         # Feed token to splitter; get back any ready phrases
                         for phrase in splitter.feed(delta):
                             await phrase_queue.put(phrase)
@@ -328,29 +399,26 @@ class S2SPipeline:
             await error_queue.put(RuntimeError(f"LLM stream error: {e}"))
         finally:
             await phrase_queue.put(None)  # signal TTS consumer to finish
+            await output_queue.put(None)  # signal output drain: LLM done
 
-    async def _stream_tts_from_queue(
+    async def _stream_tts_to_output(
         self,
         phrase_queue: asyncio.Queue,
-        audio_queue: asyncio.Queue,
+        output_queue: asyncio.Queue,
         error_queue: asyncio.Queue,
         language: str,
         tracker: LatencyTracker,
     ) -> None:
         """
         Launches each phrase synthesis concurrently and delivers audio into
-        audio_queue in strict phrase order.
+        output_queue in strict phrase order.
 
         Two-phase approach:
           Phase 1 — Dispatch: read all phrases and create a synth worker per
                       phrase.  Each worker signals a started_event on its
                       first line so we know synthesis has actually begun.
           Phase 2 — Drain:    read each worker's output queue in order,
-                      forwarding audio chunks to audio_queue.
-
-        Between the phases we ``await asyncio.gather(*started_events)``
-        which yields to the event loop and guarantees every worker has
-        started before we begin consuming audio.
+                      forwarding audio chunks to output_queue.
         """
         first_audio = True
         first_audio_lock = asyncio.Lock()
@@ -362,7 +430,7 @@ class S2SPipeline:
             out_queue: asyncio.Queue[bytes | None],
             started_event: asyncio.Event,
         ) -> None:
-            started_event.set()  # signal that this worker is running
+            started_event.set()
             try:
                 async for audio_chunk in self.tts.synthesise_stream.remote_gen.aio(
                     phrase, language=language
@@ -395,8 +463,6 @@ class S2SPipeline:
             jobs.append((out_queue, task))
             started_events.append(started_event)
 
-        # Wait until every worker has actually started executing so
-        # synthesis is in-flight before we begin consuming audio.
         if started_events:
             await asyncio.gather(*(e.wait() for e in started_events))
 
@@ -413,14 +479,14 @@ class S2SPipeline:
                         if first_audio:
                             tracker.mark("first_audio_byte")
                             first_audio = False
-                    await audio_queue.put(chunk)
+                    await output_queue.put(chunk)
         except asyncio.TimeoutError:
             logger.warning(f"[{self.session_id}] TTS stream timed out.")
         finally:
             await asyncio.gather(
                 *(task for _, task in jobs), return_exceptions=True
             )
-            await audio_queue.put(None)
+            await output_queue.put(None)  # signal output drain: TTS done
 
 
 # ─────────────────────────────────────────

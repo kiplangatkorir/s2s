@@ -80,6 +80,27 @@ def create_app(
                     await websocket.send_json({"type": "turn_complete", "session_id": session_id})
                     continue
 
+                if payload.get("type") == "text_input":
+                    text = payload.get("text", "").strip()
+                    if not text:
+                        await websocket.send_json({"type": "empty_turn"})
+                        continue
+
+                    audio_buffer.clear()
+
+                    try:
+                        async for chunk in pipeline.run_text(text):
+                            if isinstance(chunk, dict):
+                                await websocket.send_json(chunk)
+                            else:
+                                await websocket.send_bytes(chunk)
+                    except Exception as exc:
+                        await websocket.send_json({"type": "error", "detail": str(exc)})
+                        continue
+
+                    await websocket.send_json({"type": "turn_complete", "session_id": session_id})
+                    continue
+
                 await websocket.send_json({"type": "ack", "detail": payload})
         except WebSocketDisconnect:
             sessions.pop(session_id, None)

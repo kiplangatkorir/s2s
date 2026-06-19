@@ -36,7 +36,7 @@ async def test_tts_queue_starts_follow_up_phrases_concurrently() -> None:
     pipeline._tts = _FakeTTS(started, release_first)
 
     phrase_queue: asyncio.Queue[str | None] = asyncio.Queue()
-    audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+    output_queue: asyncio.Queue[bytes | dict | None] = asyncio.Queue()
     await phrase_queue.put("first")
     await phrase_queue.put("second")
     await phrase_queue.put(None)
@@ -44,9 +44,9 @@ async def test_tts_queue_starts_follow_up_phrases_concurrently() -> None:
     async def collect() -> list[bytes]:
         chunks: list[bytes] = []
         task = asyncio.create_task(
-            pipeline._stream_tts_from_queue(
+            pipeline._stream_tts_to_output(
                 phrase_queue,
-                audio_queue,
+                output_queue,
                 asyncio.Queue(),
                 language="sw",
                 tracker=LatencyTracker(session_id="tts-test"),
@@ -56,11 +56,14 @@ async def test_tts_queue_starts_follow_up_phrases_concurrently() -> None:
         assert started == ["first", "second"]
 
         release_first.set()
-        while True:
-            chunk = await audio_queue.get()
-            if chunk is None:
-                break
-            chunks.append(chunk)
+        sentinels = 0
+        while sentinels < 1:
+            item = await output_queue.get()
+            if item is None:
+                sentinels += 1
+                continue
+            if isinstance(item, bytes):
+                chunks.append(item)
         await task
         return chunks
 
