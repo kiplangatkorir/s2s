@@ -112,7 +112,11 @@ class SentenceSplitter:
         if len(buf) >= self.flush_chars:
             cut = buf.rfind(" ", self.flush_chars, MAX_CHARS)
             if cut == -1:
-                cut = min(len(buf), MAX_CHARS)
+                if len(buf) < MAX_CHARS:
+                    return None
+                cut = buf.rfind(" ", 0, MAX_CHARS)
+                if cut == -1:
+                    cut = MAX_CHARS
             phrase = buf[:cut].strip()
             if phrase:
                 self._buffer = buf[cut:].lstrip()

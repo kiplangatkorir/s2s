@@ -34,6 +34,10 @@ VOXCPM_DIR = "/opt/VoxCPM"
 SAMPLE_RATE = 48_000
 CHANNELS = 1
 SYNTHESIS_CHUNK_CHARS = 120
+TTS_CFG_VALUE = 1.8
+TTS_INFERENCE_TIMESTEPS = 10
+EDGE_FADE_MS = 6.0
+PCM_PEAK_LIMIT = 0.98
 
 
 tts_image = (
@@ -121,42 +125,58 @@ class SautiTTS:
         voice_cfg = self.voices.get(voice_name, self.voices["female"])
         t0 = time.perf_counter()
 
+        first_audio_logged = False
         for i, phrase in enumerate(_split_for_synthesis(text, SYNTHESIS_CHUNK_CHARS)):
-            audio_float32 = self._synthesise_phrase(phrase, voice_cfg, seed_offset=i)
-            chunks = (
-                _encode_opus(audio_float32, self.sample_rate)
-                if output_format == "opus"
-                else _encode_pcm(audio_float32)
-            )
-            for chunk in chunks:
-                yield chunk
-
-            if i == 0:
-                elapsed = (time.perf_counter() - t0) * 1000
-                print(f"[SautiTTS] First audio chunk in {elapsed:.1f}ms: {phrase[:60]!r}")
+            audio_chunks = self._synthesise_phrase_chunks(phrase, voice_cfg, seed_offset=i)
+            for audio_float32 in _iter_click_safe_chunks(audio_chunks, self.sample_rate):
+                chunks = (
+                    _encode_opus(audio_float32, self.sample_rate)
+                    if output_format == "opus"
+                    else _encode_pcm(audio_float32)
+                )
+                for chunk in chunks:
+                    if not first_audio_logged:
+                        elapsed = (time.perf_counter() - t0) * 1000
+                        print(
+                            f"[SautiTTS] First audio chunk in {elapsed:.1f}ms: "
+                            f"{phrase[:60]!r}"
+                        )
+                        first_audio_logged = True
+                    yield chunk
 
         total = (time.perf_counter() - t0) * 1000
         print(f"[SautiTTS] Synthesis complete in {total:.1f}ms: {text[:80]!r}")
 
-    def _synthesise_phrase(self, text: str, voice_cfg: dict, seed_offset: int = 0) -> np.ndarray:
+    def _synthesise_phrase_chunks(
+        self,
+        text: str,
+        voice_cfg: dict,
+        seed_offset: int = 0,
+    ) -> Iterator[np.ndarray]:
         import torch
 
         torch.manual_seed(42 + seed_offset)
-        audio = self.model.generate(
-            text=text,
+        kwargs = dict(
+            text=normalize_for_tts(text),
             prompt_wav_path=voice_cfg["wav"],
             prompt_text=voice_cfg["text"],
             reference_wav_path=voice_cfg["wav"],
-            cfg_value=2.0,
-            inference_timesteps=10,
-            normalize=True,
+            cfg_value=TTS_CFG_VALUE,
+            inference_timesteps=TTS_INFERENCE_TIMESTEPS,
+            normalize=False,
             denoise=False,
-            retry_badcase=False,
+            retry_badcase=True,
         )
-        audio = np.asarray(audio, dtype=np.float32)
+
+        if hasattr(self.model, "generate_streaming"):
+            for chunk in self.model.generate_streaming(**kwargs):
+                yield np.asarray(chunk, dtype=np.float32).reshape(-1)
+            return
+
+        audio = np.asarray(self.model.generate(**kwargs), dtype=np.float32).reshape(-1)
         if audio.size == 0:
-            return np.zeros(self.sample_rate // 4, dtype=np.float32)
-        return np.clip(audio, -1.0, 1.0)
+            audio = np.zeros(self.sample_rate // 4, dtype=np.float32)
+        yield audio
 
     @modal.method()
     def synthesise_full(self, text: str, language: str = "sw", voice: str | None = None) -> bytes:
@@ -339,6 +359,60 @@ def _split_for_synthesis(text: str, max_chars: int) -> list[str]:
     if current:
         chunks.append(current.strip())
     return chunks
+
+
+def _iter_click_safe_chunks(
+    chunks: Iterator[np.ndarray],
+    sample_rate: int,
+) -> Iterator[np.ndarray]:
+    previous: np.ndarray | None = None
+    first = True
+
+    for chunk in chunks:
+        audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            continue
+        if previous is not None:
+            yield _apply_edge_fades(
+                previous,
+                sample_rate,
+                fade_in=first,
+                fade_out=False,
+            )
+            first = False
+        previous = audio
+
+    if previous is not None:
+        yield _apply_edge_fades(
+            previous,
+            sample_rate,
+            fade_in=first,
+            fade_out=True,
+        )
+
+
+def _apply_edge_fades(
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    fade_in: bool,
+    fade_out: bool,
+) -> np.ndarray:
+    shaped = np.nan_to_num(np.asarray(audio, dtype=np.float32).reshape(-1)).copy()
+    if shaped.size == 0:
+        return shaped
+
+    np.clip(shaped, -PCM_PEAK_LIMIT, PCM_PEAK_LIMIT, out=shaped)
+    fade_samples = min(int(sample_rate * EDGE_FADE_MS / 1000), shaped.size // 2)
+    if fade_samples <= 1:
+        return shaped
+
+    curve = np.sin(np.linspace(0.0, np.pi / 2.0, fade_samples, dtype=np.float32)) ** 2
+    if fade_in:
+        shaped[:fade_samples] *= curve
+    if fade_out:
+        shaped[-fade_samples:] *= curve[::-1]
+    return shaped
 
 
 def _encode_pcm(audio: np.ndarray, chunk_samples: int = 4096) -> Iterator[bytes]:
