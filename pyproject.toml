@@ -1,0 +1,19 @@
+[project]
+name = "sauti-s2s"
+version = "0.1.0"
+description = "Sauti speech-to-speech pipeline"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110",
+  "httpx<0.28",
+  "modal>=1.4",
+  "numpy<2",
+  "pydantic>=2",
+  "uvicorn>=0.27",
+  "websockets>=12",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]

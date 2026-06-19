@@ -1,0 +1,5 @@
+# Gateway deployment wrapper:
+#   modal deploy gateway/modal_app.py
+#
+# The Modal app attaches secret `deepseek`, which must contain
+# `DEEPSEEK_API_KEY`.

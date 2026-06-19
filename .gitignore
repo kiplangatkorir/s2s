@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.modal_logs/
+
+# Local smoke-test artifacts
+smoke_tts.wav
+live_turn_output.wav
