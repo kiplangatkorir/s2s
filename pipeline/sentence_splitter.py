@@ -110,9 +110,14 @@ class SentenceSplitter:
         # main source of delay for first-audio playback.
         # Also acts as hard cap: no phrase will exceed MAX_CHARS.
         if len(buf) >= self.flush_chars:
-            cut = buf.rfind(" ", self.flush_chars, MAX_CHARS)
+            # We want to break at the last word boundary before the end of the buffer,
+            # or before MAX_CHARS if it's too long.
+            search_end = min(len(buf), MAX_CHARS)
+            cut = buf.rfind(" ", 0, search_end)
             if cut == -1:
-                cut = min(len(buf), MAX_CHARS)
+                if len(buf) < MAX_CHARS:
+                    return None
+                cut = MAX_CHARS
             phrase = buf[:cut].strip()
             if phrase:
                 self._buffer = buf[cut:].lstrip()

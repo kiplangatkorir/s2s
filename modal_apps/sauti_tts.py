@@ -121,20 +121,74 @@ class SautiTTS:
         voice_cfg = self.voices.get(voice_name, self.voices["female"])
         t0 = time.perf_counter()
 
+        import torch
+
         for i, phrase in enumerate(_split_for_synthesis(text, SYNTHESIS_CHUNK_CHARS)):
-            audio_float32 = self._synthesise_phrase(phrase, voice_cfg, seed_offset=i)
-            chunks = (
-                _encode_opus(audio_float32, self.sample_rate)
-                if output_format == "opus"
-                else _encode_pcm(audio_float32)
-            )
-            for chunk in chunks:
-                yield chunk
+            torch.manual_seed(42 + i)
 
-            if i == 0:
-                elapsed = (time.perf_counter() - t0) * 1000
-                print(f"[SautiTTS] First audio chunk in {elapsed:.1f}ms: {phrase[:60]!r}")
+            # VoxCPM's streaming API yields partial waveforms as it decodes
+            if hasattr(self.model, "generate_streaming"):
+                audio_iter = self.model.generate_streaming(
+                    text=phrase,
+                    prompt_wav_path=voice_cfg["wav"],
+                    prompt_text=voice_cfg["text"],
+                    reference_wav_path=voice_cfg["wav"],
+                    cfg_value=2.0,
+                    inference_timesteps=10,
+                    normalize=True,
+                    denoise=False,
+                    retry_badcase=True,
+                )
+            else:
+                # Fallback to full phrase generation if streaming isn't available
+                audio_iter = [self._synthesise_phrase(phrase, voice_cfg, seed_offset=i)]
 
+            prev_chunk = None
+            is_first_chunk = True
+
+            for audio_float32 in audio_iter:
+                if isinstance(audio_float32, torch.Tensor):
+                    audio_float32 = audio_float32.detach().cpu().numpy()
+                audio_float32 = np.asarray(audio_float32, dtype=np.float32)
+                if audio_float32.size == 0:
+                    continue
+
+                audio_float32 = np.clip(audio_float32, -1.0, 1.0)
+
+                # Shape the start edge of the phrase
+                if is_first_chunk:
+                    audio_float32 = _fade_in(audio_float32, fade_ms=10, sample_rate=self.sample_rate)
+                    is_first_chunk = False
+
+                if prev_chunk is not None:
+                    chunks = (
+                        _encode_opus(prev_chunk, self.sample_rate)
+                        if output_format == "opus"
+                        else _encode_pcm(prev_chunk)
+                    )
+                    for chunk in chunks:
+                        yield chunk
+
+                    if i == 0 and prev_chunk is not None and not hasattr(self, '_logged_first'):
+                        self._logged_first = True
+                        elapsed = (time.perf_counter() - t0) * 1000
+                        print(f"[SautiTTS] First audio chunk in {elapsed:.1f}ms: {phrase[:60]!r}")
+
+                prev_chunk = audio_float32
+
+            # The very last chunk of the phrase needs fade out
+            if prev_chunk is not None:
+                prev_chunk = _fade_out(prev_chunk, fade_ms=10, sample_rate=self.sample_rate)
+                chunks = (
+                    _encode_opus(prev_chunk, self.sample_rate)
+                    if output_format == "opus"
+                    else _encode_pcm(prev_chunk)
+                )
+                for chunk in chunks:
+                    yield chunk
+
+        if hasattr(self, '_logged_first'):
+            del self._logged_first
         total = (time.perf_counter() - t0) * 1000
         print(f"[SautiTTS] Synthesis complete in {total:.1f}ms: {text[:80]!r}")
 
@@ -397,3 +451,24 @@ def main(
     with open(output, "wb") as handle:
         handle.write(wav)
     print(f"[local] Saved {output}")
+
+
+def _fade_in(audio: np.ndarray, fade_ms: int = 10, sample_rate: int = 48000) -> np.ndarray:
+    fade_samples = int(sample_rate * fade_ms / 1000)
+    if fade_samples == 0 or len(audio) == 0:
+        return audio
+    fade_samples = min(fade_samples, len(audio))
+    fade = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+    out = audio.copy()
+    out[:fade_samples] *= fade
+    return out
+
+def _fade_out(audio: np.ndarray, fade_ms: int = 10, sample_rate: int = 48000) -> np.ndarray:
+    fade_samples = int(sample_rate * fade_ms / 1000)
+    if fade_samples == 0 or len(audio) == 0:
+        return audio
+    fade_samples = min(fade_samples, len(audio))
+    fade = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+    out = audio.copy()
+    out[-fade_samples:] *= fade
+    return out
