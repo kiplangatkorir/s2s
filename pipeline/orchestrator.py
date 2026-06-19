@@ -55,7 +55,7 @@ class PipelineConfig:
     deepseek_model: str = "deepseek-v4-flash"
     max_history_tokens: int = 768         # tighter prompt budget for lower TTFT
     tts_chunk_size: int = 25             # smaller phrase chunks = earlier first audio
-    stream_timeout_s: float = 30.0       # max seconds for a full turn
+    stream_timeout_s: float = 90.0       # max seconds to wait for TTS audio
     system_prompt: str = (
         "You are a concise voice assistant. "
         "Reply briefly in the same language as the user."
