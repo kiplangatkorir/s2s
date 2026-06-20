@@ -94,7 +94,7 @@ class SautiTTS:
         print(f"[SautiTTS] Loading Swahili LoRA from {lora_dir}")
         self.model = VoxCPM.from_pretrained(
             str(model_dir),
-            load_denoiser=True,
+            load_denoiser=False,
             optimize=True,
             lora_config=lora_config,
             lora_weights_path=str(lora_dir),
@@ -139,10 +139,10 @@ class SautiTTS:
                     prompt_text=voice_cfg["text"],
                     reference_wav_path=voice_cfg["wav"],
                     cfg_value=2.0,
-                    inference_timesteps=20,
+                    inference_timesteps=12,
                     normalize=True,
-                    denoise=True,
-                    retry_badcase=True,
+                    denoise=False,
+                    retry_badcase=False,
                 )
             else:
                 audio_iter = [self._synthesise_phrase(phrase, voice_cfg, seed_offset=i)]
@@ -190,9 +190,9 @@ class SautiTTS:
             prompt_text=voice_cfg["text"],
             reference_wav_path=voice_cfg["wav"],
             cfg_value=2.0,
-            inference_timesteps=20,
+            inference_timesteps=12,
             normalize=True,
-            denoise=True,
+            denoise=False,
             retry_badcase=False,
         )
         audio = np.asarray(audio, dtype=np.float32)
