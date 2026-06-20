@@ -54,7 +54,7 @@ class PipelineConfig:
     language: str = "sw"                  # ASR + TTS language
     deepseek_model: str = "deepseek-v4-flash"
     max_history_tokens: int = 768         # tighter prompt budget for lower TTFT
-    tts_chunk_size: int = 25             # smaller phrase chunks = earlier first audio
+    tts_chunk_size: int = 80             # larger phrases = fewer TTS calls, better prosody
     stream_timeout_s: float = 30.0       # max seconds for a full turn
     system_prompt: str = (
         "You are Sauti, a warm and friendly voice assistant built by MsingiAI. "
