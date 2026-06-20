@@ -31,14 +31,14 @@ class SentenceSplitter:
     Collect emitted phrases, then call flush() at end-of-stream.
     """
 
-    def __init__(self, flush_chars: int = 50):
+    def __init__(self, flush_chars: int = 50, first_flush_chars: int | None = None):
         """
         flush_chars: minimum buffer size before a soft boundary triggers a flush.
-        Lower = more responsive TTS start, but more TTS calls.
-        Higher = fewer calls, slightly longer wait for first audio.
-        Recommended: 40–80 chars.
+        first_flush_chars: lower threshold for the first phrase only — lets TTS start sooner.
         """
         self.flush_chars = flush_chars
+        self.first_flush_chars = first_flush_chars or max(20, flush_chars // 2)
+        self._first_phrase_emitted = False
         self._buffer = ""
         self._all_text: list[str] = []
 
@@ -76,6 +76,7 @@ class SentenceSplitter:
     def reset(self) -> None:
         self._buffer = ""
         self._all_text = []
+        self._first_phrase_emitted = False
 
     # ── internal ──────────────────────────────
 
@@ -93,23 +94,26 @@ class SentenceSplitter:
             self._buffer = buf[m.end():].lstrip()
             if phrase:
                 self._all_text.append(phrase)
+                self._first_phrase_emitted = True
                 return phrase
 
         # 2. Soft boundary — only if buffer is long enough
-        if len(buf) >= self.flush_chars:
+        threshold = self.first_flush_chars if not self._first_phrase_emitted else self.flush_chars
+        if len(buf) >= threshold:
             m = SOFT_BOUNDARIES.search(buf)
             if m:
                 phrase = buf[: m.end()].strip()
                 self._buffer = buf[m.end():].lstrip()
                 if phrase:
                     self._all_text.append(phrase)
+                    self._first_phrase_emitted = True
                     return phrase
 
         # 3. Safety valve — flush at word boundary once buffer reaches flush_chars.
         # This avoids waiting for punctuation on the first chunk, which is the
         # main source of delay for first-audio playback.
         # Also acts as hard cap: no phrase will exceed MAX_CHARS.
-        if len(buf) >= self.flush_chars:
+        if len(buf) >= threshold:
             # We want to break at the last word boundary before the end of the buffer,
             # or before MAX_CHARS if it's too long.
             search_end = min(len(buf), MAX_CHARS)
@@ -122,6 +126,7 @@ class SentenceSplitter:
             if phrase:
                 self._buffer = buf[cut:].lstrip()
                 self._all_text.append(phrase)
+                self._first_phrase_emitted = True
                 return phrase
 
         return None

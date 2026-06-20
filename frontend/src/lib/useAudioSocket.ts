@@ -8,6 +8,11 @@ export type Message = {
   text: string;
 };
 
+const SILENCE_RMS_THRESHOLD = 0.012;
+const SILENCE_DURATION_S = 1.4;
+const FRAME_DURATION_S = 4096 / 48000;
+const SILENCE_FRAMES = Math.ceil(SILENCE_DURATION_S / FRAME_DURATION_S);
+
 // Resample float32 audio from one rate to another (simple linear interpolation)
 function resampleFloat32(
   buffer: Float32Array,
@@ -60,6 +65,9 @@ export function useAudioSocket(url: string) {
   const nextStartTimeRef = useRef(0);
   const streamingTextRef = useRef("");
   const animFrameRef = useRef<number | null>(null);
+
+  const silenceRef = useRef({ count: 0, hasSpoken: false });
+  const stopRecordingRef = useRef<(() => void) | null>(null);
 
   const stopPlayback = useCallback(() => {
     audioQueueRef.current = [];
@@ -271,19 +279,30 @@ export function useAudioSocket(url: string) {
       const nativeSampleRate = audioCtx.sampleRate; // usually 44100 or 48000
       const TARGET_RATE = 16000;
 
+      silenceRef.current = { count: 0, hasSpoken: false };
+
       scriptNode.onaudioprocess = (e) => {
         const inputData = e.inputBuffer.getChannelData(0);
-        // Copy the data (Float32Array is reused by the browser)
         const copy = new Float32Array(inputData);
         pcmBufferRef.current.push(copy);
 
-        // Send PCM chunk immediately for low-latency streaming
-        // Resample to 16kHz and convert to int16
         const resampled = resampleFloat32(copy, nativeSampleRate, TARGET_RATE);
         const pcmBytes = float32ToInt16Bytes(resampled);
 
         if (wsRef.current?.readyState === WebSocket.OPEN) {
           wsRef.current.send(pcmBytes);
+        }
+
+        const rms = Math.sqrt(copy.reduce((s, v) => s + v * v, 0) / copy.length);
+        if (rms > SILENCE_RMS_THRESHOLD) {
+          silenceRef.current.hasSpoken = true;
+          silenceRef.current.count = 0;
+        } else if (silenceRef.current.hasSpoken) {
+          silenceRef.current.count++;
+          if (silenceRef.current.count >= SILENCE_FRAMES) {
+            silenceRef.current = { count: 0, hasSpoken: false };
+            stopRecordingRef.current?.();
+          }
         }
       };
 
@@ -330,6 +349,10 @@ export function useAudioSocket(url: string) {
       wsRef.current.send(JSON.stringify({ type: "end_turn" }));
     }
   }, [isRecording]);
+
+  useEffect(() => {
+    stopRecordingRef.current = stopRecording;
+  }, [stopRecording]);
 
   const toggleRecording = useCallback(() => {
     if (isRecording) {
