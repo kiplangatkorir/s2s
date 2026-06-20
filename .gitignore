@@ -4,6 +4,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .modal_logs/
+.kilo/
+.qwen/
 
 # Local smoke-test artifacts
 smoke_tts.wav
