@@ -426,8 +426,8 @@ class S2SPipeline:
         first_audio = True
         first_audio_lock = asyncio.Lock()
         all_tasks: list[asyncio.Task] = []
-        # Ordered list of per-phrase queues for draining in sequence
         phrase_queues: list[asyncio.Queue[bytes | None]] = []
+        dispatch_done = asyncio.Event()
 
         async def _synth_worker(
             phrase: str,
@@ -448,12 +448,6 @@ class S2SPipeline:
             finally:
                 await out_queue.put(None)
 
-        # ── Dispatch + drain concurrently ──────────
-        # As each phrase arrives, start its TTS immediately.
-        # Meanwhile, drain completed phrase audio in order.
-
-        drain_task = asyncio.current_task()
-
         async def _dispatcher():
             """Read phrases and start TTS workers as they arrive."""
             while True:
@@ -468,6 +462,7 @@ class S2SPipeline:
                 phrase_queues.append(pq)
                 task = asyncio.create_task(_synth_worker(phrase, pq))
                 all_tasks.append(task)
+            dispatch_done.set()
 
         async def _drainer():
             """Drain per-phrase queues in order, forwarding audio to output."""
@@ -476,7 +471,7 @@ class S2SPipeline:
             while True:
                 # Wait for the next phrase queue to appear
                 while idx >= len(phrase_queues):
-                    if not any(not t.done() for t in all_tasks) and idx >= len(phrase_queues):
+                    if dispatch_done.is_set() and idx >= len(phrase_queues):
                         return
                     await asyncio.sleep(0.01)
 
