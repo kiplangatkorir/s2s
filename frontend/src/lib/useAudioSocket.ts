@@ -368,6 +368,18 @@ export function useAudioSocket(url: string) {
 
       stopPlayback();
 
+      // Initialize audio context during user interaction (browser requirement)
+      if (
+        !audioPlaybackContextRef.current ||
+        audioPlaybackContextRef.current.state === "closed"
+      ) {
+        audioPlaybackContextRef.current = new (window.AudioContext ||
+          (window as any).webkitAudioContext)();
+      }
+      if (audioPlaybackContextRef.current.state === "suspended") {
+        audioPlaybackContextRef.current.resume();
+      }
+
       setMessages((prev) => [
         ...prev,
         { id: `user-${Date.now()}`, role: "user", text: text.trim() },
