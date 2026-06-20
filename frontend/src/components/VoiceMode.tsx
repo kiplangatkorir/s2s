@@ -1,12 +1,14 @@
 "use client";
 
-import { Mic, MicOff, X } from "lucide-react";
+import { Mic, MicOff, X, WifiOff } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 
 type Props = {
   isRecording: boolean;
   isThinking: boolean;
   isSpeaking: boolean;
+  isConnected: boolean;
+  connectionError: string | null;
   toggleRecording: () => void;
   onClose: () => void;
 };
@@ -15,6 +17,8 @@ export default function VoiceMode({
   isRecording,
   isThinking,
   isSpeaking,
+  isConnected,
+  connectionError,
   toggleRecording,
   onClose,
 }: Props) {
@@ -63,6 +67,16 @@ export default function VoiceMode({
         }}
       />
 
+      {/* Connection warning banner */}
+      {!isConnected && (
+        <div className="relative w-full flex items-center justify-center gap-2 px-6 py-3 bg-red-900/40 border-b border-red-500/30">
+          <WifiOff className="w-4 h-4 text-red-400" />
+          <span className="text-red-300 text-xs font-medium">
+            {connectionError || "Connecting to voice server…"}
+          </span>
+        </div>
+      )}
+
       {/* Top bar */}
       <div className="relative w-full flex items-center justify-between px-6 pt-6">
         <div>
@@ -104,8 +118,11 @@ export default function VoiceMode({
       <div className="relative pb-24 flex flex-col items-center gap-5">
         <button
           onClick={toggleRecording}
+          disabled={!isConnected}
           className={`p-6 rounded-full transition-all duration-300 ${
-            isRecording
+            !isConnected
+              ? "bg-gray-600 text-gray-400 cursor-not-allowed opacity-50"
+              : isRecording
               ? "bg-red-600 text-white hover:bg-red-700 scale-110 shadow-[0_0_40px_rgba(220,38,38,0.3)]"
               : "bg-white text-[var(--gray-900)] hover:bg-[var(--gray-100)] shadow-warm-lg hover:-translate-y-0.5"
           }`}
@@ -117,7 +134,11 @@ export default function VoiceMode({
           )}
         </button>
         <p className="text-white/15 text-xs tracking-wide">
-          {isRecording ? t("tapToStop") : t("tapToSpeak")}
+          {!isConnected
+            ? "Waiting for connection…"
+            : isRecording
+            ? t("tapToStop")
+            : t("tapToSpeak")}
         </p>
       </div>
     </div>

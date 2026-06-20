@@ -19,6 +19,7 @@ export default function ChatUI() {
     isThinking,
     isSpeaking,
     streamingText,
+    connectionError,
     toggleRecording,
     stopPlayback,
     sendText,
@@ -158,6 +159,8 @@ export default function ChatUI() {
           isRecording={isRecording}
           isThinking={isThinking}
           isSpeaking={isSpeaking}
+          isConnected={isConnected}
+          connectionError={connectionError}
           toggleRecording={toggleRecording}
           onClose={() => {
             if (isRecording) toggleRecording();

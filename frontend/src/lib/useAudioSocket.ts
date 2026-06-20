@@ -45,6 +45,7 @@ export function useAudioSocket(url: string) {
   const [isThinking, setIsThinking] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [streamingText, setStreamingText] = useState("");
+  const [connectionError, setConnectionError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -141,10 +142,16 @@ export function useAudioSocket(url: string) {
 
       ws.onopen = () => {
         setIsConnected(true);
+        setConnectionError(null);
+      };
+
+      ws.onerror = () => {
+        setConnectionError("Unable to connect to voice server");
       };
 
       ws.onclose = () => {
         setIsConnected(false);
+        setConnectionError("Voice server disconnected");
         reconnectTimer = setTimeout(connectWs, 3000);
       };
 
@@ -212,6 +219,11 @@ export function useAudioSocket(url: string) {
   }, [url, playAudioChunk]);
 
   const startRecording = useCallback(async () => {
+    if (!isConnected) {
+      setConnectionError("Cannot record: not connected to voice server");
+      return;
+    }
+
     stopPlayback();
 
     try {
@@ -267,7 +279,7 @@ export function useAudioSocket(url: string) {
     } catch (err) {
       console.error("Error accessing microphone:", err);
     }
-  }, [stopPlayback]);
+  }, [stopPlayback, isConnected]);
 
   const stopRecording = useCallback(() => {
     if (!isRecording) return;
@@ -337,6 +349,7 @@ export function useAudioSocket(url: string) {
     isThinking,
     isSpeaking,
     streamingText,
+    connectionError,
     toggleRecording,
     stopPlayback,
     sendText,
