@@ -35,6 +35,10 @@ gateway_image = (
             "__pycache__",
             "*.pyc",
             "smoke_tts.wav",
+            "node_modules",
+            ".next",
+            "frontend/node_modules",
+            "frontend/.next",
         ],
     )
 )

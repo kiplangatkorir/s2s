@@ -34,6 +34,7 @@ VOXCPM_DIR = "/opt/VoxCPM"
 SAMPLE_RATE = 48_000
 CHANNELS = 1
 SYNTHESIS_CHUNK_CHARS = 120
+CROSSFADE_MS = 40
 
 
 tts_image = (
@@ -94,8 +95,8 @@ class SautiTTS:
         print(f"[SautiTTS] Loading Swahili LoRA from {lora_dir}")
         self.model = VoxCPM.from_pretrained(
             str(model_dir),
-            load_denoiser=False,
-            optimize=False,
+            load_denoiser=True,
+            optimize=True,
             lora_config=lora_config,
             lora_weights_path=str(lora_dir),
         )
@@ -117,11 +118,14 @@ class SautiTTS:
         if not text:
             return
 
-        voice_name = (voice or "female").lower()
-        voice_cfg = self.voices.get(voice_name, self.voices["female"])
+        voice_name = (voice or "male").lower()
+        voice_cfg = self.voices.get(voice_name, self.voices["male"])
         t0 = time.perf_counter()
 
         import torch
+
+        crossfade_samples = int(self.sample_rate * CROSSFADE_MS / 1000)
+        self._prev_tail: np.ndarray | None = None
 
         for i, phrase in enumerate(_split_for_synthesis(text, SYNTHESIS_CHUNK_CHARS)):
             torch.manual_seed(42 + i)
@@ -134,58 +138,79 @@ class SautiTTS:
                     prompt_text=voice_cfg["text"],
                     reference_wav_path=voice_cfg["wav"],
                     cfg_value=2.0,
-                    inference_timesteps=10,
+                    inference_timesteps=20,
                     normalize=True,
-                    denoise=False,
+                    denoise=True,
                     retry_badcase=True,
                 )
             else:
                 # Fallback to full phrase generation if streaming isn't available
                 audio_iter = [self._synthesise_phrase(phrase, voice_cfg, seed_offset=i)]
 
-            prev_chunk = None
-            is_first_chunk = True
-
+            phrase_chunks: list[np.ndarray] = []
             for audio_float32 in audio_iter:
                 if isinstance(audio_float32, torch.Tensor):
                     audio_float32 = audio_float32.detach().cpu().numpy()
                 audio_float32 = np.asarray(audio_float32, dtype=np.float32)
                 if audio_float32.size == 0:
                     continue
-
                 audio_float32 = np.clip(audio_float32, -1.0, 1.0)
+                phrase_chunks.append(audio_float32)
 
-                # Shape the start edge of the phrase
-                if is_first_chunk:
-                    audio_float32 = _fade_in(audio_float32, fade_ms=10, sample_rate=self.sample_rate)
-                    is_first_chunk = False
+            if not phrase_chunks:
+                continue
 
-                if prev_chunk is not None:
-                    chunks = (
-                        _encode_opus(prev_chunk, self.sample_rate)
-                        if output_format == "opus"
-                        else _encode_pcm(prev_chunk)
-                    )
-                    for chunk in chunks:
+            # Concatenate all streaming partials into one phrase buffer
+            phrase_audio = np.concatenate(phrase_chunks)
+
+            # ── Cross-phrase overlap: blend tail of prev phrase with head of this one
+            if self._prev_tail is not None and len(self._prev_tail) > 0:
+                overlap = min(len(self._prev_tail), len(phrase_audio))
+                if overlap > 0:
+                    tail_part = self._prev_tail[-overlap:]
+                    head_part = phrase_audio[:overlap]
+                    blend = np.linspace(1.0, 0.0, overlap, dtype=np.float32)
+                    phrase_audio[:overlap] = head_part * (1.0 - blend) + tail_part * blend
+                    # Flush everything before the overlap region from prev_tail
+                    if len(self._prev_tail) > overlap:
+                        pre = self._prev_tail[:-overlap]
+                        for chunk in _encode_pcm(pre) if output_format != "opus" else _encode_opus(pre, self.sample_rate):
+                            yield chunk
+                else:
+                    for chunk in _encode_pcm(self._prev_tail) if output_format != "opus" else _encode_opus(self._prev_tail, self.sample_rate):
                         yield chunk
+                self._prev_tail = None
 
-                    if i == 0 and prev_chunk is not None and not hasattr(self, '_logged_first'):
-                        self._logged_first = True
-                        elapsed = (time.perf_counter() - t0) * 1000
-                        print(f"[SautiTTS] First audio chunk in {elapsed:.1f}ms: {phrase[:60]!r}")
+            # Fade in the very first phrase of the entire utterance
+            if i == 0:
+                phrase_audio = _fade_in(phrase_audio, fade_ms=20, sample_rate=self.sample_rate)
 
-                prev_chunk = audio_float32
+            # Save tail for crossfade with the next phrase
+            overlap = min(crossfade_samples, len(phrase_audio))
+            if overlap > 0:
+                self._prev_tail = phrase_audio[-overlap:].copy()
+                body = phrase_audio[:-overlap]
+            else:
+                self._prev_tail = None
+                body = phrase_audio
 
-            # The very last chunk of the phrase needs fade out
-            if prev_chunk is not None:
-                prev_chunk = _fade_out(prev_chunk, fade_ms=10, sample_rate=self.sample_rate)
-                chunks = (
-                    _encode_opus(prev_chunk, self.sample_rate)
-                    if output_format == "opus"
-                    else _encode_pcm(prev_chunk)
-                )
-                for chunk in chunks:
+            if body.size > 0:
+                enc = _encode_opus if output_format == "opus" else _encode_pcm
+                for chunk in enc(body, self.sample_rate) if output_format == "opus" else enc(body):
                     yield chunk
+
+            if i == 0 and body.size > 0 and not hasattr(self, '_logged_first'):
+                self._logged_first = True
+                elapsed = (time.perf_counter() - t0) * 1000
+                print(f"[SautiTTS] First audio chunk in {elapsed:.1f}ms: {phrase[:60]!r}")
+
+        # Flush remaining tail with fade-out (end of utterance)
+        if self._prev_tail is not None and len(self._prev_tail) > 0:
+            tail = _fade_out(self._prev_tail, fade_ms=20, sample_rate=self.sample_rate)
+            enc = _encode_opus if output_format == "opus" else _encode_pcm
+            for chunk in enc(tail, self.sample_rate) if output_format == "opus" else enc(tail):
+                yield chunk
+            self._prev_tail = None
 
         if hasattr(self, '_logged_first'):
             del self._logged_first
@@ -202,9 +227,9 @@ class SautiTTS:
             prompt_text=voice_cfg["text"],
             reference_wav_path=voice_cfg["wav"],
             cfg_value=2.0,
-            inference_timesteps=10,
+            inference_timesteps=20,
             normalize=True,
-            denoise=False,
+            denoise=True,
             retry_badcase=False,
         )
         audio = np.asarray(audio, dtype=np.float32)
@@ -254,8 +279,8 @@ def _load_voice_prompts() -> dict[str, dict[str, str]]:
             "text": normalize_for_tts(female_text),
         },
         "default": {
-            "wav": f"{DATA_DIR}/wavs/{female_id}.wav",
-            "text": normalize_for_tts(female_text),
+            "wav": f"{DATA_DIR}/wavs/{male_id}.wav",
+            "text": normalize_for_tts(male_text),
         },
     }
 
@@ -436,7 +461,7 @@ def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
 def main(
     text: str = "Habari yako! Mimi ni msaidizi wa sauti.",
     language: str = "sw",
-    voice: str = "female",
+    voice: str = "male",
     output: str = "test_output.wav",
 ) -> None:
     tts = SautiTTS()
