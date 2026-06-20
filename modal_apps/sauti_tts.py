@@ -128,6 +128,7 @@ class SautiTTS:
         encode = _encode_opus if output_format == "opus" else _encode_pcm
         logged_first = False
         first_chunk = True
+        prev_tail = None  # Track tail across phrases for cross-phrase smoothing
 
         for i, phrase in enumerate(phrases):
             torch.manual_seed(42 + i)
@@ -151,7 +152,6 @@ class SautiTTS:
 
             # Stream chunks immediately with on-the-fly overlap-add smoothing
             overlap = int(self.sample_rate * 0.005)  # 5ms overlap
-            prev_tail = None
             
             for raw_chunk in audio_iter:
                 if isinstance(raw_chunk, torch.Tensor):
