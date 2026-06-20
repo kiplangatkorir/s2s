@@ -147,54 +147,30 @@ class SautiTTS:
             else:
                 audio_iter = [self._synthesise_phrase(phrase, voice_cfg, seed_offset=i)]
 
-            # Collect all partials, apply fades, then stream in small chunks
-            parts: list[np.ndarray] = []
+            # Stream chunks immediately - just yield them as they come
+            first_chunk = True
             for raw_chunk in audio_iter:
                 if isinstance(raw_chunk, torch.Tensor):
                     raw_chunk = raw_chunk.detach().cpu().numpy()
-                raw_chunk = np.asarray(raw_chunk, dtype=np.float32)
-                if raw_chunk.size == 0:
+                chunk = np.asarray(raw_chunk, dtype=np.float32)
+                if chunk.size == 0:
                     continue
-                parts.append(np.clip(raw_chunk, -1.0, 1.0))
-
-            if not parts:
-                continue
-            phrase_audio = np.concatenate(parts)
-
-            if phrase_audio.size == 0:
-                continue
-
-            # Smooth internal chunk boundaries with overlap-add crossfade
-            overlap = int(self.sample_rate * 0.005)  # 5ms overlap
-            if overlap > 0 and len(parts) > 1:
-                smoothed_parts = [parts[0]]
-                for j in range(1, len(parts)):
-                    prev = smoothed_parts[-1]
-                    curr = parts[j]
-                    ov = min(overlap, len(prev), len(curr))
-                    if ov > 0:
-                        blend = np.linspace(1.0, 0.0, ov, dtype=np.float32)
-                        head = curr[:ov] * (1.0 - blend) + prev[-ov:] * blend
-                        curr = np.concatenate([head, curr[ov:]])
-                    smoothed_parts[-1] = prev[:-ov] if ov < len(prev) else prev
-                    smoothed_parts.append(curr)
-                phrase_audio = np.concatenate(smoothed_parts)
-
-            # Fade edges
-            fade_in_ms = 15 if is_first else 5
-            fade_out_ms = 15 if is_last else 5
-            phrase_audio = _fade_in(phrase_audio, fade_ms=fade_in_ms, sample_rate=self.sample_rate)
-            phrase_audio = _fade_out(phrase_audio, fade_ms=fade_out_ms, sample_rate=self.sample_rate)
-
-            if not logged_first:
-                logged_first = True
-                elapsed = (time.perf_counter() - t0) * 1000
-                print(f"[SautiTTS] First audio in {elapsed:.1f}ms: {phrase[:60]!r}")
-
-            if output_format == "opus":
-                yield from encode(phrase_audio, self.sample_rate)
-            else:
-                yield from encode(phrase_audio)
+                chunk = np.clip(chunk, -1.0, 1.0)
+                
+                # Apply fade-in on very first chunk of very first phrase
+                if is_first and first_chunk:
+                    chunk = _fade_in(chunk, fade_ms=15, sample_rate=self.sample_rate)
+                    first_chunk = False
+                
+                if not logged_first:
+                    logged_first = True
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    print(f"[SautiTTS] First chunk in {elapsed:.1f}ms: {phrase[:60]!r}")
+                
+                if output_format == "opus":
+                    yield from encode(chunk, self.sample_rate)
+                else:
+                    yield from encode(chunk)
         total = (time.perf_counter() - t0) * 1000
         print(f"[SautiTTS] Synthesis complete in {total:.1f}ms: {text[:80]!r}")
 

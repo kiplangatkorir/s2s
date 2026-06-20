@@ -37,7 +37,7 @@ class SentenceSplitter:
         first_flush_chars: lower threshold for the first phrase only — lets TTS start sooner.
         """
         self.flush_chars = flush_chars
-        self.first_flush_chars = first_flush_chars or max(20, flush_chars // 2)
+        self.first_flush_chars = first_flush_chars or 30
         self._first_phrase_emitted = False
         self._buffer = ""
         self._all_text: list[str] = []
