@@ -163,13 +163,10 @@ class SautiTTS:
 
                 # Apply overlap-add with previous chunk's tail
                 if prev_tail is not None and len(chunk) >= overlap:
-                    # Create Hann window for smooth blending
-                    hann = np.hanning(overlap * 2)
-                    hann = hann / np.max(hann)
-                    
-                    # Blend the overlap region
-                    blend = hann[:overlap]
-                    chunk[:overlap] = chunk[:overlap] * blend + prev_tail[-overlap:] * (1 - blend)
+                    # Linear crossfade: fade in new chunk, fade out old chunk
+                    fade_in = np.linspace(0, 1, overlap, dtype=np.float32)
+                    fade_out = np.linspace(1, 0, overlap, dtype=np.float32)
+                    chunk[:overlap] = chunk[:overlap] * fade_in + prev_tail[-overlap:] * fade_out
                     prev_tail = None
 
                 # Save the tail of this chunk for next iteration
