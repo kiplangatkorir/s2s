@@ -63,6 +63,7 @@ hf_secret = modal.Secret.from_name("hf-secret", required_keys=["HF_TOKEN"])
     secrets=[hf_secret],
     timeout=300,
     startup_timeout=900,
+    env={"TTS_VERSION": "2.1-hann-smoothing"},
 )
 class SautiTTS:
     """Persistent GPU TTS worker backed by VoxCPM2 plus the WAXAL Swahili LoRA."""
@@ -147,11 +148,8 @@ class SautiTTS:
             else:
                 audio_iter = [self._synthesise_phrase(phrase, voice_cfg, seed_offset=i)]
 
-            # Stream chunks with overlap-add crossfade to prevent clicks
-            overlap = int(self.sample_rate * 0.005)  # 5ms overlap between chunks
-            prev_tail = None
-            first_chunk = True
-            
+            # Collect all streaming partials for this phrase
+            phrase_chunks = []
             for raw_chunk in audio_iter:
                 if isinstance(raw_chunk, torch.Tensor):
                     raw_chunk = raw_chunk.detach().cpu().numpy()
@@ -159,42 +157,64 @@ class SautiTTS:
                 if chunk.size == 0:
                     continue
                 chunk = np.clip(chunk, -1.0, 1.0)
+                phrase_chunks.append(chunk)
 
-                # Crossfade with previous chunk's tail
-                if prev_tail is not None and overlap > 0 and len(chunk) >= overlap:
-                    blend = np.linspace(1.0, 0.0, overlap, dtype=np.float32)
-                    chunk[:overlap] = chunk[:overlap] * blend + prev_tail * (1.0 - blend)
-                    prev_tail = None
+            if not phrase_chunks:
+                continue
 
-                # Save tail for next crossfade
-                if overlap > 0 and len(chunk) > overlap:
-                    prev_tail = chunk[-overlap:].copy()
-                    chunk_to_send = chunk[:-overlap]
-                else:
-                    chunk_to_send = chunk
+            # Concatenate all partials into one array
+            phrase_audio = np.concatenate(phrase_chunks)
+            
+            print(f"[SautiTTS-v2-HANN] Phrase {i}: {len(phrase_audio)} samples before smoothing")
+            
+            # Apply overlap-add smoothing with Hann window to eliminate internal discontinuities
+            overlap = int(self.sample_rate * 0.005)  # 5ms overlap
+            if len(phrase_audio) > overlap * 4:
+                # Create Hann window for overlap-add
+                hann = np.hanning(overlap * 2)
+                hann = hann / np.max(hann)  # Normalize to peak at 1.0
+                
+                smoothed = np.zeros(len(phrase_audio), dtype=np.float32)
+                weight_sum = np.zeros(len(phrase_audio), dtype=np.float32)
+                
+                # Process in overlapping windows
+                step = overlap
+                pos = 0
+                while pos + overlap * 2 <= len(phrase_audio):
+                    window_data = phrase_audio[pos:pos + overlap * 2]
+                    smoothed[pos:pos + overlap * 2] += window_data * hann
+                    weight_sum[pos:pos + overlap * 2] += hann
+                    pos += step
+                
+                # Add any remaining samples without windowing
+                if pos < len(phrase_audio):
+                    smoothed[pos:] += phrase_audio[pos:]
+                    weight_sum[pos:] += 1.0
+                
+                # Normalize by weight sum to prevent amplitude changes
+                smoothed = np.where(weight_sum > 0, smoothed / weight_sum, smoothed)
+                phrase_audio = smoothed
 
-                # Apply fade-in on very first chunk of very first phrase
-                if is_first and first_chunk:
-                    chunk_to_send = _fade_in(chunk_to_send, fade_ms=15, sample_rate=self.sample_rate)
-                    first_chunk = False
+            # Apply fade-in on very first chunk of very first phrase
+            if is_first and first_chunk:
+                phrase_audio = _fade_in(phrase_audio, fade_ms=15, sample_rate=self.sample_rate)
+                first_chunk = False
 
-                if not logged_first:
-                    logged_first = True
-                    elapsed = (time.perf_counter() - t0) * 1000
-                    print(f"[SautiTTS] First chunk in {elapsed:.1f}ms: {phrase[:60]!r}")
+            # Log first chunk timing
+            if not logged_first:
+                logged_first = True
+                elapsed = (time.perf_counter() - t0) * 1000
+                print(f"[SautiTTS] First chunk in {elapsed:.1f}ms: {phrase[:60]!r}")
 
+            # Encode and yield in chunks
+            chunk_size = int(self.sample_rate * 0.1)  # 100ms chunks
+            for i in range(0, len(phrase_audio), chunk_size):
+                chunk_to_send = phrase_audio[i:i + chunk_size]
                 if chunk_to_send.size > 0:
                     if output_format == "opus":
                         yield from encode(chunk_to_send, self.sample_rate)
                     else:
                         yield from encode(chunk_to_send)
-            
-            # Yield any remaining tail
-            if prev_tail is not None and prev_tail.size > 0:
-                if output_format == "opus":
-                    yield from encode(prev_tail, self.sample_rate)
-                else:
-                    yield from encode(prev_tail)
         total = (time.perf_counter() - t0) * 1000
         print(f"[SautiTTS] Synthesis complete in {total:.1f}ms: {text[:80]!r}")
 
