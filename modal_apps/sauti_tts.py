@@ -163,10 +163,10 @@ class SautiTTS:
             if phrase_audio.size == 0:
                 continue
 
-            if is_first:
-                phrase_audio = _fade_in(phrase_audio, fade_ms=15, sample_rate=self.sample_rate)
-            if is_last:
-                phrase_audio = _fade_out(phrase_audio, fade_ms=15, sample_rate=self.sample_rate)
+            fade_in_ms = 15 if is_first else 3
+            fade_out_ms = 15 if is_last else 3
+            phrase_audio = _fade_in(phrase_audio, fade_ms=fade_in_ms, sample_rate=self.sample_rate)
+            phrase_audio = _fade_out(phrase_audio, fade_ms=fade_out_ms, sample_rate=self.sample_rate)
 
             if not logged_first:
                 logged_first = True
