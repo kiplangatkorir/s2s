@@ -136,23 +136,35 @@ export function useAudioSocket(url: string) {
 
   useEffect(() => {
     let reconnectTimer: ReturnType<typeof setTimeout>;
+    let retryCount = 0;
+    let disposed = false;
 
     const connectWs = () => {
+      if (disposed) return;
       const ws = new WebSocket(url);
 
       ws.onopen = () => {
         setIsConnected(true);
         setConnectionError(null);
+        retryCount = 0;
       };
 
       ws.onerror = () => {
-        setConnectionError("Unable to connect to voice server");
+        if (retryCount === 0) {
+          setConnectionError("Connecting to voice server\u2026");
+        }
       };
 
       ws.onclose = () => {
         setIsConnected(false);
-        setConnectionError("Voice server disconnected");
-        reconnectTimer = setTimeout(connectWs, 3000);
+        const delay = Math.min(1000 * 2 ** retryCount, 30000);
+        retryCount++;
+        if (retryCount <= 3) {
+          setConnectionError("Connecting to voice server\u2026");
+        } else {
+          setConnectionError("Voice server disconnected");
+        }
+        reconnectTimer = setTimeout(connectWs, delay);
       };
 
       ws.onmessage = async (event) => {
@@ -164,6 +176,13 @@ export function useAudioSocket(url: string) {
         if (typeof event.data === "string") {
           try {
             const data = JSON.parse(event.data);
+
+            if (data.type === "ping") {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "pong" }));
+              }
+              return;
+            }
 
             if (data.type === "transcript") {
               setMessages((prev) => [
@@ -212,6 +231,7 @@ export function useAudioSocket(url: string) {
     connectWs();
 
     return () => {
+      disposed = true;
       clearTimeout(reconnectTimer);
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
       if (wsRef.current) wsRef.current.close();

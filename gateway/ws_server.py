@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import Callable
@@ -9,6 +10,8 @@ from collections.abc import Callable
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from pipeline.orchestrator import S2SPipeline
+
+HEARTBEAT_INTERVAL_S = 20
 
 
 def create_app(
@@ -32,12 +35,22 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    async def _heartbeat(ws: WebSocket) -> None:
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+                await ws.send_json({"type": "ping"})
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
         session_id = websocket.query_params.get("session_id") or str(uuid.uuid4())
         pipeline = get_pipeline(session_id)
         audio_buffer = bytearray()
+
+        heartbeat_task = asyncio.create_task(_heartbeat(websocket))
 
         try:
             while True:
@@ -57,6 +70,9 @@ def create_app(
                     payload = json.loads(message["text"])
                 except json.JSONDecodeError:
                     await websocket.send_json({"type": "error", "detail": "invalid_json"})
+                    continue
+
+                if payload.get("type") == "pong":
                     continue
 
                 if payload.get("type") == "end_turn":
@@ -103,6 +119,7 @@ def create_app(
 
                 await websocket.send_json({"type": "ack", "detail": payload})
         except WebSocketDisconnect:
+            heartbeat_task.cancel()
             sessions.pop(session_id, None)
             return
 
