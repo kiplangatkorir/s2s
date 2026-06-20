@@ -55,7 +55,7 @@ class PipelineConfig:
     deepseek_model: str = "deepseek-v4-flash"
     max_history_tokens: int = 768         # tighter prompt budget for lower TTFT
     tts_chunk_size: int = 100            # fewer phrases = fewer TTS calls, smoother audio
-    stream_timeout_s: float = 30.0       # max seconds for a full turn
+    stream_timeout_s: float = 60.0       # max seconds for a full turn
     system_prompt: str = (
         "You are Sauti, a warm and friendly voice assistant built by MsingiAI. "
         "You speak naturally and conversationally. "
@@ -432,17 +432,23 @@ class S2SPipeline:
         async def _synth_worker(
             phrase: str,
             out_queue: asyncio.Queue[bytes | None],
+            phrase_idx: int,
         ) -> None:
             try:
+                logger.debug(f"[{self.session_id}] TTS phrase {phrase_idx} starting synthesis")
+                chunk_count = 0
                 async for audio_chunk in self.tts.synthesise_stream.remote_gen.aio(
                     phrase, language=language
                 ):
                     if self.barge_in.triggered:
+                        logger.debug(f"[{self.session_id}] TTS phrase {phrase_idx} interrupted")
                         return
                     await out_queue.put(audio_chunk)
+                    chunk_count += 1
+                logger.debug(f"[{self.session_id}] TTS phrase {phrase_idx} complete: {chunk_count} chunks")
             except Exception as exc:
                 logger.error(
-                    f"[{self.session_id}] TTS phrase error: {exc}", exc_info=True
+                    f"[{self.session_id}] TTS phrase {phrase_idx} error: {exc}", exc_info=True
                 )
                 await error_queue.put(RuntimeError(f"TTS stream error: {exc}"))
             finally:
@@ -450,6 +456,7 @@ class S2SPipeline:
 
         async def _dispatcher():
             """Read phrases and start TTS workers as they arrive."""
+            phrase_idx = 0
             while True:
                 phrase = await phrase_queue.get()
                 if phrase is None or self.barge_in.triggered:
@@ -457,12 +464,14 @@ class S2SPipeline:
                 if not phrase.strip():
                     continue
 
-                logger.debug(f"[{self.session_id}] TTS phrase: '{phrase}'")
+                logger.debug(f"[{self.session_id}] Dispatching TTS phrase {phrase_idx}: '{phrase}'")
                 pq: asyncio.Queue[bytes | None] = asyncio.Queue()
                 phrase_queues.append(pq)
-                task = asyncio.create_task(_synth_worker(phrase, pq))
+                task = asyncio.create_task(_synth_worker(phrase, pq, phrase_idx))
                 all_tasks.append(task)
+                phrase_idx += 1
             dispatch_done.set()
+            logger.debug(f"[{self.session_id}] TTS dispatcher complete: {phrase_idx} phrases dispatched")
 
         async def _drainer():
             """Drain per-phrase queues in order, forwarding audio to output."""
@@ -472,13 +481,17 @@ class S2SPipeline:
                 # Wait for the next phrase queue to appear
                 while idx >= len(phrase_queues):
                     if dispatch_done.is_set() and idx >= len(phrase_queues):
+                        logger.debug(f"[{self.session_id}] TTS drainer complete")
                         return
                     await asyncio.sleep(0.01)
 
                 pq = phrase_queues[idx]
+                logger.debug(f"[{self.session_id}] TTS drainer waiting for phrase {idx}")
+                chunk_count = 0
                 while True:
                     chunk = await pq.get()
                     if chunk is None:
+                        logger.debug(f"[{self.session_id}] TTS drainer phrase {idx} complete: {chunk_count} chunks")
                         break
                     if self.barge_in.triggered:
                         return
@@ -486,18 +499,21 @@ class S2SPipeline:
                         if first_audio:
                             tracker.mark("first_audio_byte")
                             first_audio = False
+                            logger.debug(f"[{self.session_id}] First audio chunk from phrase {idx}")
                     await output_queue.put(chunk)
+                    chunk_count += 1
                 idx += 1
 
         dispatch_task = asyncio.create_task(_dispatcher())
-        drain_coro = _drainer()
+        drain_task = asyncio.create_task(_drainer())
 
         try:
-            await asyncio.gather(dispatch_task, drain_coro)
+            await asyncio.gather(dispatch_task, drain_task)
         except asyncio.CancelledError:
             pass
         finally:
             dispatch_task.cancel()
+            drain_task.cancel()
             await asyncio.gather(*all_tasks, return_exceptions=True)
             await output_queue.put(None)  # signal output drain: TTS done
 
