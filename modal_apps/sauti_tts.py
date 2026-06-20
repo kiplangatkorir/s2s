@@ -147,8 +147,11 @@ class SautiTTS:
             else:
                 audio_iter = [self._synthesise_phrase(phrase, voice_cfg, seed_offset=i)]
 
-            # Stream chunks immediately - just yield them as they come
+            # Stream chunks with overlap-add crossfade to prevent clicks
+            overlap = int(self.sample_rate * 0.005)  # 5ms overlap between chunks
+            prev_tail = None
             first_chunk = True
+            
             for raw_chunk in audio_iter:
                 if isinstance(raw_chunk, torch.Tensor):
                     raw_chunk = raw_chunk.detach().cpu().numpy()
@@ -156,21 +159,42 @@ class SautiTTS:
                 if chunk.size == 0:
                     continue
                 chunk = np.clip(chunk, -1.0, 1.0)
-                
+
+                # Crossfade with previous chunk's tail
+                if prev_tail is not None and overlap > 0 and len(chunk) >= overlap:
+                    blend = np.linspace(1.0, 0.0, overlap, dtype=np.float32)
+                    chunk[:overlap] = chunk[:overlap] * blend + prev_tail * (1.0 - blend)
+                    prev_tail = None
+
+                # Save tail for next crossfade
+                if overlap > 0 and len(chunk) > overlap:
+                    prev_tail = chunk[-overlap:].copy()
+                    chunk_to_send = chunk[:-overlap]
+                else:
+                    chunk_to_send = chunk
+
                 # Apply fade-in on very first chunk of very first phrase
                 if is_first and first_chunk:
-                    chunk = _fade_in(chunk, fade_ms=15, sample_rate=self.sample_rate)
+                    chunk_to_send = _fade_in(chunk_to_send, fade_ms=15, sample_rate=self.sample_rate)
                     first_chunk = False
-                
+
                 if not logged_first:
                     logged_first = True
                     elapsed = (time.perf_counter() - t0) * 1000
                     print(f"[SautiTTS] First chunk in {elapsed:.1f}ms: {phrase[:60]!r}")
-                
+
+                if chunk_to_send.size > 0:
+                    if output_format == "opus":
+                        yield from encode(chunk_to_send, self.sample_rate)
+                    else:
+                        yield from encode(chunk_to_send)
+            
+            # Yield any remaining tail
+            if prev_tail is not None and prev_tail.size > 0:
                 if output_format == "opus":
-                    yield from encode(chunk, self.sample_rate)
+                    yield from encode(prev_tail, self.sample_rate)
                 else:
-                    yield from encode(chunk)
+                    yield from encode(prev_tail)
         total = (time.perf_counter() - t0) * 1000
         print(f"[SautiTTS] Synthesis complete in {total:.1f}ms: {text[:80]!r}")
 
