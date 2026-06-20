@@ -11,7 +11,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from pipeline.orchestrator import S2SPipeline
 
-HEARTBEAT_INTERVAL_S = 20
+HEARTBEAT_INTERVAL_S = 8
+RECEIVE_TIMEOUT_S = 45
 
 
 def create_app(
@@ -35,12 +36,23 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    async def _heartbeat(ws: WebSocket) -> None:
+    async def _heartbeat(ws: WebSocket, pong_received: asyncio.Event) -> None:
+        """Send pings every HEARTBEAT_INTERVAL_S. If no pong within 2 intervals, close."""
+        missed = 0
         try:
             while True:
                 await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+                pong_received.clear()
                 await ws.send_json({"type": "ping"})
-        except (WebSocketDisconnect, RuntimeError):
+                try:
+                    await asyncio.wait_for(pong_received.wait(), timeout=HEARTBEAT_INTERVAL_S * 2)
+                    missed = 0
+                except asyncio.TimeoutError:
+                    missed += 1
+                    if missed >= 2:
+                        await ws.close(code=1001, reason="heartbeat_timeout")
+                        return
+        except (WebSocketDisconnect, RuntimeError, Exception):
             pass
 
     @app.websocket("/ws")
@@ -50,11 +62,18 @@ def create_app(
         pipeline = get_pipeline(session_id)
         audio_buffer = bytearray()
 
-        heartbeat_task = asyncio.create_task(_heartbeat(websocket))
+        pong_received = asyncio.Event()
+        heartbeat_task = asyncio.create_task(_heartbeat(websocket, pong_received))
 
         try:
             while True:
-                message = await websocket.receive()
+                try:
+                    message = await asyncio.wait_for(
+                        websocket.receive(), timeout=RECEIVE_TIMEOUT_S
+                    )
+                except asyncio.TimeoutError:
+                    await websocket.close(code=1001, reason="receive_timeout")
+                    break
 
                 if message.get("type") == "websocket.disconnect":
                     break
@@ -73,6 +92,7 @@ def create_app(
                     continue
 
                 if payload.get("type") == "pong":
+                    pong_received.set()
                     continue
 
                 if payload.get("type") == "end_turn":
@@ -82,18 +102,9 @@ def create_app(
 
                     audio_bytes = bytes(audio_buffer)
                     audio_buffer.clear()
-
-                    try:
-                        async for chunk in pipeline.run(audio_bytes):
-                            if isinstance(chunk, dict):
-                                await websocket.send_json(chunk)
-                            else:
-                                await websocket.send_bytes(chunk)
-                    except Exception as exc:
-                        await websocket.send_json({"type": "error", "detail": str(exc)})
-                        continue
-
-                    await websocket.send_json({"type": "turn_complete", "session_id": session_id})
+                    asyncio.create_task(
+                        _run_pipeline_turn(pipeline, audio_bytes, websocket, session_id)
+                    )
                     continue
 
                 if payload.get("type") == "text_input":
@@ -103,18 +114,9 @@ def create_app(
                         continue
 
                     audio_buffer.clear()
-
-                    try:
-                        async for chunk in pipeline.run_text(text):
-                            if isinstance(chunk, dict):
-                                await websocket.send_json(chunk)
-                            else:
-                                await websocket.send_bytes(chunk)
-                    except Exception as exc:
-                        await websocket.send_json({"type": "error", "detail": str(exc)})
-                        continue
-
-                    await websocket.send_json({"type": "turn_complete", "session_id": session_id})
+                    asyncio.create_task(
+                        _run_text_turn(pipeline, text, websocket, session_id)
+                    )
                     continue
 
                 await websocket.send_json({"type": "ack", "detail": payload})
@@ -122,6 +124,50 @@ def create_app(
             heartbeat_task.cancel()
             sessions.pop(session_id, None)
             return
+
+    async def _run_pipeline_turn(
+        pipeline: object,
+        audio_bytes: bytes,
+        ws: WebSocket,
+        session_id: str,
+    ) -> None:
+        try:
+            async for chunk in pipeline.run(audio_bytes):
+                if isinstance(chunk, dict):
+                    await ws.send_json(chunk)
+                else:
+                    await ws.send_bytes(chunk)
+        except Exception as exc:
+            try:
+                await ws.send_json({"type": "error", "detail": str(exc)})
+            except (WebSocketDisconnect, RuntimeError):
+                return
+        try:
+            await ws.send_json({"type": "turn_complete", "session_id": session_id})
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+
+    async def _run_text_turn(
+        pipeline: object,
+        text: str,
+        ws: WebSocket,
+        session_id: str,
+    ) -> None:
+        try:
+            async for chunk in pipeline.run_text(text):
+                if isinstance(chunk, dict):
+                    await ws.send_json(chunk)
+                else:
+                    await ws.send_bytes(chunk)
+        except Exception as exc:
+            try:
+                await ws.send_json({"type": "error", "detail": str(exc)})
+            except (WebSocketDisconnect, RuntimeError):
+                return
+        try:
+            await ws.send_json({"type": "turn_complete", "session_id": session_id})
+        except (WebSocketDisconnect, RuntimeError):
+            pass
 
     return app
 
